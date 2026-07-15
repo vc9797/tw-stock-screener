@@ -6,6 +6,10 @@ from datetime import datetime, timedelta
 
 st.set_page_config(page_title="台股實戰策略篩選器", layout="wide")
 
+# 初始化 Session State 用於追蹤 API 錯誤
+if "api_last_error" not in st.session_state:
+    st.session_state["api_last_error"] = None
+
 # ==========================================
 # 0. FinMind API 數據下載核心函數
 # ==========================================
@@ -21,14 +25,20 @@ def fetch_finmind_data(dataset, stock_id, start_date, token=""):
     
     try:
         resp = requests.get(url, params=parameter, timeout=10)
-        if resp.status_code == 200 and resp.json().get("msg") == "success":
-            return pd.DataFrame(resp.json()["data"])
+        if resp.status_code == 200:
+            resp_json = resp.json()
+            if resp_json.get("msg") == "success":
+                return pd.DataFrame(resp_json["data"])
+            else:
+                st.session_state["api_last_error"] = f"API 回傳限制: {resp_json.get('msg', '未知錯誤')}"
+        elif resp.status_code == 429:
+            st.session_state["api_last_error"] = "⚠️ 觸發 API 每小時限制 (429 Too Many Requests)！請於左側輸入免費申請的 FinMind Token。"
     except Exception as e:
-        pass
+        st.session_state["api_last_error"] = f"網路請求失敗: {str(e)}"
     return pd.DataFrame()
 
 # ==========================================
-# 1. 核心選股邏輯演算法（已加入防禦性防錯）
+# 1. 核心選股邏輯演算法（修正 ROE 計算與防錯機制）
 # ==========================================
 def scan_single_stock(stock_id, token, settings):
     today_str = datetime.today().strftime('%Y-%m-%d')
@@ -49,15 +59,17 @@ def scan_single_stock(stock_id, token, settings):
     
     latest_price = df_price['close'].iloc[-1]
     
-    # 條件 7: 股價剛突破整理平台（而非已大漲 50%）
+    # 條件: 股價剛突破整理平台（排除已暴漲股）
     price_60d = df_price['close'].tail(60)
     min_60d = price_60d.min()
     max_gain_60d = ((price_60d.max() - min_60d) / min_60d) * 100 if min_60d > 0 else 0.0
-    if max_gain_60d > settings['max_60d_gain']:
+    
+    # 如果過濾開關開啟，才進行最高漲幅過濾
+    if settings['filter_max_gain'] and max_gain_60d > settings['max_60d_gain']:
         return None
         
     price_20d = df_price['close'].tail(20)
-    is_breakout = latest_price >= price_20d.max() * 0.99
+    is_breakout = latest_price >= price_20d.max() * 0.98  # 容許 2% 誤差
     if settings['filter_breakout'] and not is_breakout:
         return None
 
@@ -74,14 +86,14 @@ def scan_single_stock(stock_id, token, settings):
         foreign_data = df_chip[df_chip['name'] == 'Foreign_Investor'].tail(10)
         foreign_net = foreign_data['buy'] - foreign_data['sell']
         for val in reversed(foreign_net.values):
-            if val < -1000: 
+            if val < -1000:  # 單日大賣超 1000 張以上算大賣
                 consecutive_sell += 1
             else:
                 break
-        if consecutive_sell > settings['max_foreign_sell_days']:
+        if settings['filter_foreign_sell'] and consecutive_sell > settings['max_foreign_sell_days']:
             return None
     else:
-        # 如果找不到籌碼欄位且使用者有設限制，則排除
+        # 籌碼數據缺失時，若設定了大於0的硬性指標則排除
         if settings['min_sitc_buy'] > 0:
             return None
 
@@ -92,19 +104,17 @@ def scan_single_stock(stock_id, token, settings):
 
     # --- D. 基本面數據 (營收) ---
     df_rev = fetch_finmind_data("TaiwanStockMonthRevenue", stock_id, start_1y, token)
-    # 【關鍵修復點】安全檢查：必須同時確保不為空、有該欄位、且資料大於3筆
     if not df_rev.empty and 'revenue_year_growth' in df_rev.columns and len(df_rev) >= 3:
         recent_3m_growth = df_rev['revenue_year_growth'].tail(3).mean()
         if recent_3m_growth < settings['min_rev_yoy']:
             return None
     else:
-        # 缺乏營收年增率欄位（新股或資料缺失），直接排除
-        return None
+        return None  # 營收為基本門檻，缺失直接排除
 
     # --- E. 財務報表數據 (EPS / ROE) ---
     df_finance = fetch_finmind_data("TaiwanStockFinancialStatements", stock_id, start_1y, token)
     if not df_finance.empty and all(col in df_finance.columns for col in ['type', 'value', 'date']):
-        # EPS 成長檢查
+        # 1. EPS 成長檢查
         df_eps = df_finance[df_finance['type'] == 'EPS'].sort_values('date')
         if len(df_eps) >= 4:
             eps_values = df_eps['value'].tail(4).values
@@ -114,9 +124,16 @@ def scan_single_stock(stock_id, token, settings):
         elif settings['filter_eps']:
             return None
         
-        # ROE 檢查
-        df_roe = df_finance[df_finance['type'] == 'ReturnOnEquity'].tail(1)
-        latest_roe = df_roe['value'].iloc[-1] if not df_roe.empty else 0.0
+        # 2. ROE 計算修正 (TTM 稅後淨利 / 最新股東權益)
+        df_net = df_finance[df_finance['type'].isin(['NetIncome', 'NetIncomeAfterTax'])].sort_values('date')
+        df_eq = df_finance[df_finance['type'] == 'Equity'].sort_values('date')
+        
+        if not df_net.empty and not df_eq.empty:
+            ttm_net = df_net['value'].tail(4).sum()  # 最近四季淨利加總
+            latest_eq = df_eq['value'].iloc[-1]       # 最新一季股東權益
+            if latest_eq > 0:
+                latest_roe = (ttm_net / latest_eq) * 100
+        
         if latest_roe < settings['min_roe']:
             return None
     else:
@@ -127,7 +144,7 @@ def scan_single_stock(stock_id, token, settings):
         "股號": stock_id,
         "現價": latest_price,
         "近3月均營收年增(%)": round(recent_3m_growth, 2),
-        "ROE(%)": round(latest_roe, 2),
+        "計算後ROE(%)": round(latest_roe, 2),
         "投信10日淨買(張)": int(sitc_10d),
         "外資連大賣天數": consecutive_sell,
         "近60日最高漲幅(%)": round(max_gain_60d, 1),
@@ -141,17 +158,34 @@ st.title("🚀 實戰級台股多頭策略篩選器")
 st.subheader("數據源：FinMind 真實盤後 API 接口")
 
 st.sidebar.header("🔑 API 金鑰配置")
-api_token = st.sidebar.text_input("請輸入 FinMind Token (留空限制30次/小時):", type="password")
+api_token = st.sidebar.text_input("請輸入 FinMind Token (極度建議輸入，可免除每小時限制):", type="password")
+st.sidebar.markdown("[👉 按此免費註冊並取得 Token](https://api.finmindtrade.com/) (1分鐘搞定)")
 
 st.sidebar.header("🎯 策略參數微調")
+min_rev_yoy = st.sidebar.slider("近 3 個月營收年增率 > (%)", -10, 30, 15)
+min_roe = st.sidebar.slider("ROE > (%)", 0, 30, 15)
+filter_eps = st.sidebar.checkbox("要求近四季 EPS 成長", value=True)
+min_sitc_buy = st.sidebar.number_input("投信近 10 日偏買超大於 (張)", value=100)
+
+st.sidebar.subheader("⚠️ 容忍度調整 (往右滑較寬鬆)")
+filter_foreign_sell = st.sidebar.checkbox("限制外資連續大賣", value=True)
+max_foreign_sell_days = st.sidebar.slider("外資連續大賣天數上限 (天)", 1, 10, 5)
+
+filter_max_gain = st.sidebar.checkbox("過濾已暴漲股票", value=True)
+max_60d_gain = st.sidebar.slider("近 60 日最高漲幅上限 (%)", 30, 150, 60)
+
+filter_breakout = st.sidebar.checkbox("要求股價剛突破/在平台高點 (20日高點 2% 內)", value=True)
+
 settings = {
-    'min_rev_yoy': st.sidebar.slider("近 3 個月營收年增率 > (%)", 0, 30, 15),
-    'min_roe': st.sidebar.slider("ROE > (%)", 0, 30, 15),
-    'filter_eps': st.sidebar.checkbox("要求近四季 EPS 成長", value=True),
-    'min_sitc_buy': st.sidebar.number_input("投信近 10 日偏買超大於 (張)", value=100),
-    'max_foreign_sell_days': st.sidebar.slider("外資連續大賣天數上限 (天)", 1, 5, 3),
-    'filter_breakout': st.sidebar.checkbox("要求股價剛突破整理平台", value=True),
-    'max_60d_gain': st.sidebar.slider("近 60 日最高漲幅上限 (%)", 30, 100, 50)
+    'min_rev_yoy': min_rev_yoy,
+    'min_roe': min_roe,
+    'filter_eps': filter_eps,
+    'min_sitc_buy': min_sitc_buy,
+    'filter_foreign_sell': filter_foreign_sell,
+    'max_foreign_sell_days': max_foreign_sell_days,
+    'filter_max_gain': filter_max_gain,
+    'max_60d_gain': max_60d_gain,
+    'filter_breakout': filter_breakout
 }
 
 st.markdown("### 🔍 步驟 1: 選擇掃描池範疇")
@@ -162,6 +196,9 @@ if stock_pool_type == "台灣50成份股精選":
 else:
     custom_input = st.text_input("請輸入欲掃描的台股代碼（用逗號隔開）：", "2330,2317,2454,2382,2603")
     target_stocks = [s.strip() for s in custom_input.split(",")]
+
+# 重置錯誤訊息
+st.session_state["api_last_error"] = None
 
 if st.button("🔥 開始全方位真實數據篩選", type="primary"):
     progress_bar = st.progress(0)
@@ -178,10 +215,15 @@ if st.button("🔥 開始全方位真實數據篩選", type="primary"):
         
     status_text.text("📊 篩選完成！")
     
+    # 顯示 API 限制警告
+    if st.session_state["api_last_error"]:
+        st.error(st.session_state["api_last_error"])
+        st.info("💡 由於 FinMind 限制未登入用戶每小時僅能存取 30 次，請到 FinMind 官網申請免費的個人 API Token 並填入左側，即可完美流暢使用！")
+    
     st.markdown("### 🏆 策略篩選結果")
     if results:
         df_res = pd.DataFrame(results)
         st.dataframe(df_res, use_container_width=True)
-        st.success(f"🎉 成功尋找到 {len(df_res)} 檔同時符合「量價突破、法人鎖碼、基本面爆發」的黃金潛力股！")
+        st.success(f"🎉 成功尋找到 {len(df_res)} 檔符合條件的黃金潛力股！")
     else:
-        st.warning("😓 當前市場數據中，暫時沒有股票同時滿足您設定的嚴格條件。建議從側邊欄放寬營收或投信買超標準再試一次！")
+        st.warning("😓 當前市場數據中，暫時沒有股票同時滿足您設定的條件。建議從側邊欄「放寬」營收、取消勾選「要求股價剛突破整理平台」再試一次！")
